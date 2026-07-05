@@ -8,6 +8,4 @@ Kolkata chat users routinely write Bengali and Hindi in Roman script, mixed with
 
 [![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://mix-chat-normalizer.streamlit.app/)
 
-## Screenshots
-
 
