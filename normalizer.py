@@ -71,12 +71,6 @@ def _get_client() -> genai.Client:
 
 
 async def _try_model(client: genai.Client, model: str, prompt: str) -> dict:
-    # NOTE: `timeout` is NOT a valid field on GenerateContentConfig in the
-    # current google-genai SDK. Passing it there raised a validation error on
-    # every call, which was the root cause of the "Gemini API request failed"
-    # message showing up unconditionally. Real per-call timeout is enforced
-    # below via asyncio.wait_for instead, which doesn't depend on SDK-specific
-    # config fields.
     coro = client.aio.models.generate_content(
         model=model,
         contents=prompt,
@@ -88,21 +82,31 @@ async def _try_model(client: genai.Client, model: str, prompt: str) -> dict:
     response = await asyncio.wait_for(coro, timeout=PER_MODEL_TIMEOUT_SECONDS)
 
     parsed = getattr(response, "parsed", None)
-    result = (
-        parsed
-        if isinstance(parsed, dict)
-        else json.loads(_extract_json_text(response.text))
-    )
+    if isinstance(parsed, dict):
+        _validate_result(parsed)
+        return parsed
+
+    text = getattr(response, "text", None)
+    if not text:
+        finish_reason = None
+        try:
+            finish_reason = response.candidates[0].finish_reason
+        except Exception:
+            pass
+        raise NormalizerError(
+            f"Model '{model}' returned no usable content (finish_reason={finish_reason})."
+        )
+
+    result = json.loads(_extract_json_text(text))
     _validate_result(result)
     return result
 
 
+MAX_RACE_ATTEMPTS = 2
+RACE_RETRY_DELAY_SECONDS = 2
+
+
 async def normalize_async(text: str) -> dict:
-    """
-    Returns a dict matching SCHEMA above.
-    Raises NormalizerError on API failure or malformed response — never
-    raises a raw SDK exception to the caller.
-    """
     if not text.strip():
         raise NormalizerError("Input text is required.")
 
@@ -115,38 +119,36 @@ async def normalize_async(text: str) -> dict:
         f"Input: {text}"
     )
 
-    tasks = [
-        asyncio.create_task(_try_model(client, m, prompt)) for m in MODELS_TO_TRY
-    ]
     last_error: Exception | None = None
 
-    try:
-        for coro in asyncio.as_completed(tasks):
-            try:
-                result = await coro
-                return result
-            except Exception as exc:  # noqa: BLE001 - intentionally broad, we fall back
-                last_error = exc
-                continue
-    finally:
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        # Swallow the resulting CancelledError from any task we just cancelled
-        # so it doesn't surface as an "unretrieved exception" warning in logs.
-        await asyncio.gather(*tasks, return_exceptions=True)
+    for attempt in range(MAX_RACE_ATTEMPTS):
+        tasks = [
+            asyncio.create_task(_try_model(client, m, prompt)) for m in MODELS_TO_TRY
+        ]
+        try:
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    return await coro
+                except Exception as exc:
+                    last_error = exc
+                    continue
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-    error_text = str(last_error) if last_error else "unknown error"
+        if attempt < MAX_RACE_ATTEMPTS - 1:
+            await asyncio.sleep(RACE_RETRY_DELAY_SECONDS)
+
+    error_text = str(last_error) if last_error and str(last_error) else (
+        type(last_error).__name__ if last_error else "unknown error"
+    )
 
     if "API key not valid" in error_text or "API_KEY_INVALID" in error_text:
         raise NormalizerError("Invalid API key. Please check your credentials.") from last_error
 
-    # Include the real cause in the message itself, not just as __cause__ —
-    # this way even a plain `st.error(str(e))` in app.py surfaces enough to
-    # debug, instead of a uniformly generic message every time.
-    raise NormalizerError(
-        f"Gemini API request failed: {error_text}"
-    ) from last_error
+    raise NormalizerError(f"Gemini API request failed: {error_text}") from last_error
 
 
 @lru_cache(maxsize=32)
